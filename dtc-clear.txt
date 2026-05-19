@@ -1,0 +1,387 @@
+#!/bin/bash
+#
+# dtc-clear.sh -- clear OBD-II diagnostic trouble codes.  Destructive
+#                 write counterpart to dtc.sh.
+#
+# Author:        magikh0e
+# Last updated:  05.2026
+#
+# Sends OBD-II Service 0x04 ClearDiagnosticInformation against the
+# ECM on $7E0 / $7E8 (or $7DF broadcast).  This is a DESTRUCTIVE
+# write: once acknowledged, the cleared data is gone.
+#
+# WHAT GETS CLEARED (Service 0x04 semantics, per SAE J1979)
+#     A "DTC" is a Diagnostic Trouble Code -- the standardised fault
+#     codes ECUs store when something goes wrong (P0420, P0171,
+#     C0561, B1320, U0101, ...).  Format is one letter + four hex
+#     chars; the letter says which broad system reported the fault
+#     (P=Powertrain, C=Chassis, B=Body, U=Network).  See dtc.sh's
+#     header for the bit-level encoding, or
+#     https://magikh0e.pl/pubCarHacking/bus-message-reference.html#dtc-anatomy
+#     for the full anatomy.
+#
+#     - Stored DTCs           (Mode 0x03 ShowDTCs)
+#     - Pending DTCs          (Mode 0x07 ShowPendingDTCs)
+#     - Freeze-frame data     (Mode 0x02 snapshot taken when each
+#                              MIL-trigger event occurred.  "MIL" is
+#                              the Malfunction Indicator Lamp; also
+#                              called CEL or just "the check engine
+#                              light" on the dashboard)
+#     - Readiness monitor status -- the eight emissions readiness
+#       monitors all reset to "not ready" and have to re-complete
+#       during subsequent drive cycles before an emissions inspection
+#       station will accept the OBD-II readout.
+#     - The MIL turns off immediately.
+#
+# WHAT DOES NOT GET CLEARED
+#     - Permanent DTCs (Mode 0x0A) -- regulatory requirement.  These
+#       clear only when the ECM's own monitor for that fault runs to
+#       completion N times with no fault recurrence (typically 3-4
+#       drive cycles after the underlying issue is fixed).  Service
+#       0x04 cannot bypass this; it's enforced inside the ECM.
+#     - DTCs on modules that don't speak OBD-II Mode 0x04 -- e.g.
+#       BCM-side body / chassis / network codes on FCA platforms.
+#       Those clear via UDS Service 0x14 ClearDiagnosticInformation
+#       against the specific module's address (not implemented here).
+#
+# WHY THE MIL "JUST CAME BACK ON" AFTER A CLEAR
+#     If the underlying fault is still present, the next monitor run
+#     will re-detect it and re-set the DTC.  Clearing DTCs is for
+#     after a repair, not as a way to make the MIL go away while the
+#     car still has the original problem.  Some emissions monitors
+#     take dozens of miles of mixed driving to re-complete.
+#
+# USAGE
+#     ./dtc-clear.sh                    Print summary + DTC preview,
+#                                       refuse to clear (no --yes).
+#     ./dtc-clear.sh --yes              Actually issue the clear.
+#     ./dtc-clear.sh --dry-run          Print what would be sent
+#                                       without sending anything.
+#     ./dtc-clear.sh --skip-preview --yes
+#                                       Skip the Mode 0x03 read-back
+#                                       (faster, or when dtc.sh isn't
+#                                       on PATH).
+#
+#     ./dtc-clear.sh [--yes|-y] [--dry-run] [--skip-preview]
+#                    [--wait SEC] [--verbose] [--help]
+#
+# EXIT CODES
+#     0   Success (clear acknowledged by the ECM, or --dry-run printed)
+#     1   No response from ECM (engine off?  wrong bus?  SGW gating?)
+#     2   Bad usage, invalid args, or --yes not provided
+#     3   ECM returned a Negative Response Code (likely NRC 0x33 via SGW)
+#
+# REQUIRES
+#     - can-utils                       apt install can-utils
+#     - CAN-C interface up at 500 kbps:
+#         ip link set $CAN_C up type can bitrate 500000
+#     - Vehicle powered on (ignition Run; engine doesn't need to run)
+#     - For --preview to work: dtc.sh on PATH, or in the same
+#       directory as this script.
+#
+# SECURE GATEWAY MODULE NOTE
+#     On 2018+ FCA / Stellantis vehicles, Service 0x04 is GATED by
+#     the SGW when sent through the OBD-II port -- expect NRC 0x33
+#     securityAccessDenied.  Two ways around it:
+#
+#       1. Use the behind-the-glovebox 13-way CAN connectors, which
+#          sit INSIDE the SGW boundary.  Write traffic from there
+#          reaches the ECM directly.  This is what this script
+#          assumes by default ($CAN_C = can1).
+#
+#       2. An AutoAuth subscription / cert-based SGW unlock would
+#          also work, but isn't implemented in this script.
+#
+#     Pre-2018 vehicles: no SGW, so Service 0x04 works through any
+#     entry point including OBD-II.
+#
+# REFERENCE
+#     https://magikh0e.pl/pubCarHacking/scripts/dtc.txt
+#     https://magikh0e.pl/pubCarHacking/bus-message-reference.html#obd-ii
+#     https://magikh0e.pl/pubCarHacking/secure-gateway-module.html
+#     SAE J1979       (OBD-II Mode 0x04 standardised wire format)
+#
+
+set -eu
+
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
+CAN_C=can1                    # CAN-C interface (OBD-II ECM lives here)
+ECU_REQ_ID=7E0                # ECM-specific request ID
+                              # (use 7DF to broadcast to all OBD-II ECMs)
+ECU_RES_ID=7E8                # ECM response ID
+
+DEFAULT_WAIT=0.5              # Response capture window (Service 0x04
+                              # is single-frame both ways; 0.5s plenty)
+
+# OBD-II service ID for ClearDiagnosticInformation
+SERVICE_CLEAR=04
+# Positive response = request + 0x40 = 0x44
+POS_RESPONSE=44
+
+# ---------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------
+
+ASSUME_YES=0
+DRY_RUN=0
+SKIP_PREVIEW=0
+VERBOSE=0
+WAIT="$DEFAULT_WAIT"
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+dtc-clear.sh -- clear OBD-II diagnostic trouble codes (DESTRUCTIVE)
+
+USAGE
+    $0 [--yes|-y] [--dry-run] [--skip-preview]
+       [--wait SEC] [--verbose] [--help]
+
+OPTIONS
+    -y, --yes           Required to actually send the clear request.
+                        Without this flag, the script prints a summary
+                        + DTC preview and exits without writing.
+    --dry-run           Show what would be sent without sending.
+                        Implies a non-destructive run; --yes is ignored.
+    --skip-preview      Don't read current DTCs via dtc.sh before
+                        clearing.  Faster, but you lose the "what
+                        am I about to delete" check.
+    --wait SEC          Response timeout (default: $DEFAULT_WAIT)
+    -v, --verbose       Echo raw bus traffic to stderr
+    -h, --help          Print this message
+
+WHAT IT CLEARS
+    Stored DTCs (Mode 0x03), pending DTCs (Mode 0x07), freeze-frame
+    data, readiness-monitor status.  MIL turns off.
+    NOT cleared: permanent DTCs (Mode 0x0A, regulatory requirement)
+    and non-OBD-II module DTCs (BCM / SCCM / etc. need UDS 0x14).
+
+EXAMPLES
+    $0                          Preview-only.  No write.
+    $0 --yes                    Actually clear codes.
+    $0 --dry-run                Show the cansend that would fire.
+    $0 --skip-preview --yes     Faster clear, no Mode 0x03 read-back.
+
+SGW NOTE
+    Service 0x04 is blocked by the SGW on 2018+ FCA vehicles through
+    OBD-II.  Use the behind-the-glovebox CAN connectors (the default
+    CAN_C=can1 assumes that wiring) or run on a pre-2018 vehicle.
+
+REFERENCE
+    https://magikh0e.pl/pubCarHacking/scripts/dtc.txt
+    https://magikh0e.pl/pubCarHacking/bus-message-reference.html#obd-ii
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)         ASSUME_YES=1 ;;
+        --dry-run)        DRY_RUN=1 ;;
+        --skip-preview)   SKIP_PREVIEW=1 ;;
+        --wait)           shift; WAIT="${1:-}" ;;
+        -v|--verbose)     VERBOSE=1 ;;
+        -h|--help)        usage ;;
+        --)               shift; break ;;
+        -*)
+            echo "unknown arg: $1" >&2
+            echo "usage: $0 [--yes|-y] [--dry-run] [--skip-preview] [--verbose] [--help]" >&2
+            exit 2
+            ;;
+        *)
+            echo "unexpected positional arg: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+log() { [[ $VERBOSE -eq 1 ]] && echo "$@" >&2 || true; }
+
+# Pre-flight: required tools present?
+for cmd in cansend candump; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: $cmd not found.  apt install can-utils" >&2
+        exit 2
+    fi
+done
+
+if ! ip link show "$CAN_C" >/dev/null 2>&1; then
+    echo "ERROR: CAN interface $CAN_C not found." >&2
+    echo "  Bring it up:  ip link set $CAN_C up type can bitrate 500000" >&2
+    exit 2
+fi
+
+# Locate dtc.sh for the optional Mode 0x03 read-back.  Look adjacent
+# first (same directory as this script), then PATH.
+locate_dtc_sh() {
+    local self_dir
+    self_dir="$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")"
+    if [[ -x "$self_dir/dtc.sh" ]]; then
+        echo "$self_dir/dtc.sh"
+    elif command -v dtc.sh >/dev/null 2>&1; then
+        command -v dtc.sh
+    else
+        echo ""
+    fi
+}
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+# Always print the "what this would do" summary first.
+cat <<EOF
+
+About to send: OBD-II Service 0x04 ClearDiagnosticInformation
+
+  Interface:    $CAN_C
+  Request ID:   \$$ECU_REQ_ID
+  Response ID:  \$$ECU_RES_ID
+  Frame:        ${ECU_REQ_ID}#01${SERVICE_CLEAR}000000000000
+
+This WILL clear (if accepted):
+  - Stored DTCs (Mode 0x03 codes)
+  - Pending DTCs (Mode 0x07 codes)
+  - Freeze-frame data
+  - Readiness monitor status -> "not ready"
+  - MIL turns off
+
+This will NOT clear:
+  - Permanent DTCs (Mode 0x0A) -- ECM-internal, regulatory
+  - Non-OBD-II module DTCs (BCM / SCCM / etc., need UDS Service 0x14)
+
+EOF
+
+# Optional preview: show what's currently stored.
+if [[ $SKIP_PREVIEW -eq 0 ]]; then
+    DTC_SH=$(locate_dtc_sh)
+    if [[ -n "$DTC_SH" ]]; then
+        echo "Currently stored DTCs (via dtc.sh):"
+        echo "----"
+        "$DTC_SH" --mode confirmed || true
+        echo "----"
+        echo "Currently pending DTCs:"
+        echo "----"
+        "$DTC_SH" --mode pending || true
+        echo "----"
+        echo ""
+    else
+        echo "(skipping DTC preview -- dtc.sh not found; pass --skip-preview to silence)"
+        echo ""
+    fi
+fi
+
+# Dry-run exits here without writing.
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "DRY RUN -- not sending the clear request."
+    echo "Would send: cansend $CAN_C ${ECU_REQ_ID}#01${SERVICE_CLEAR}000000000000"
+    exit 0
+fi
+
+# Confirmation gate.  No interactive prompt -- explicit --yes only.
+# (Easier to script, harder to fire by accident.)
+if [[ $ASSUME_YES -eq 0 ]]; then
+    cat <<EOF
+Refusing to clear without explicit confirmation.
+
+Re-run with --yes (or -y) to actually issue the clear:
+
+    $0 --yes
+
+EOF
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# Send the clear request and capture the response.
+# ---------------------------------------------------------------------
+
+echo "Sending Service 0x04 ClearDiagnosticInformation..."
+
+capture_file=$(mktemp)
+trap 'rm -f "$capture_file"' EXIT
+
+# Background candump filtered to the response ID.  Started before
+# the cansend so we don't race the reply.
+timeout -s TERM "$WAIT" candump -L "$CAN_C,${ECU_RES_ID}:0FFF" \
+    > "$capture_file" 2>/dev/null &
+dump_pid=$!
+
+sleep 0.1
+cansend "$CAN_C" "${ECU_REQ_ID}#01${SERVICE_CLEAR}000000000000"
+log "request : ${ECU_REQ_ID}#01${SERVICE_CLEAR}000000000000"
+
+wait "$dump_pid" 2>/dev/null || true
+
+# Look for a frame from the ECM response ID.
+response=$(grep -E "${ECU_RES_ID}#" "$capture_file" | head -1 || true)
+
+if [[ -z "$response" ]]; then
+    echo ""
+    echo "FAILURE: no response from ECM on \$$ECU_RES_ID within ${WAIT}s." >&2
+    echo "Possible causes:" >&2
+    echo "  - Vehicle off / ignition not in Run" >&2
+    echo "  - Wrong CAN interface (CAN_C=$CAN_C)" >&2
+    echo "  - SGW silently dropped the write on 2018+ FCA via OBD-II" >&2
+    echo "  - Wiring fault" >&2
+    exit 1
+fi
+
+log "response: $response"
+
+# Strip the 'candump -L' wrapper to isolate the frame data bytes.
+# Format: (1700000000.123456) can1 7E8#0144000000000000
+frame_hex="${response##*#}"
+
+# Service byte is at offset 2 (PCI is byte 0, service is byte 1).
+service_byte="${frame_hex:2:2}"
+
+if [[ "$service_byte" == "$POS_RESPONSE" ]]; then
+    echo ""
+    echo "SUCCESS: ECM acknowledged the clear (positive response 0x44)."
+    echo ""
+    echo "Stored DTCs, pending DTCs, freeze-frame data, and readiness"
+    echo "monitors have been cleared.  The MIL should turn off shortly."
+    echo ""
+    echo "If the MIL comes back on after a drive cycle, the underlying"
+    echo "fault is still present -- the next monitor run will re-detect"
+    echo "and re-set the DTC.  Service 0x04 only clears the record, not"
+    echo "the cause."
+    exit 0
+elif [[ "$service_byte" == "7F" ]]; then
+    # Negative response.  Format: PCI 03, NRI 7F, ServiceEchoed 04, NRC XX
+    nrc="${frame_hex:6:2}"
+    echo ""
+    echo "FAILURE: ECM returned Negative Response Code 0x$nrc" >&2
+    case "$nrc" in
+        11) echo "  NRC 0x11  serviceNotSupported -- ECM does not honour 0x04" >&2 ;;
+        12) echo "  NRC 0x12  subFunctionNotSupported" >&2 ;;
+        13) echo "  NRC 0x13  incorrectMessageLengthOrInvalidFormat" >&2 ;;
+        22) echo "  NRC 0x22  conditionsNotCorrect -- check ignition / engine state" >&2 ;;
+        33) echo "  NRC 0x33  securityAccessDenied" >&2
+            echo "             SGW is blocking the write.  Use the behind-the-" >&2
+            echo "             glovebox CAN connectors (inside the SGW boundary)" >&2
+            echo "             or run on a pre-2018 vehicle." >&2 ;;
+        78) echo "  NRC 0x78  requestCorrectlyReceivedResponsePending" >&2 ;;
+        *)  echo "  (look up NRC 0x$nrc in ISO 14229 Table A.1)" >&2 ;;
+    esac
+    exit 3
+else
+    echo "" >&2
+    echo "FAILURE: unexpected response shape." >&2
+    echo "  Raw response: $response" >&2
+    echo "  Expected service byte: $POS_RESPONSE (positive) or 7F (NRC)" >&2
+    echo "  Got: $service_byte" >&2
+    exit 3
+fi

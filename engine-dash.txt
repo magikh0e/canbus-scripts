@@ -1,0 +1,422 @@
+#!/bin/bash
+#
+# engine-dash.sh -- simple terminal dashboard for JEEP JT (Gladiator)
+#                   basic engine stats over OBD-II Mode 01.
+#
+# Originally created:  05.2026 by magikh0e
+#
+# WHAT IT DOES
+#   Polls a curated set of standard OBD-II Mode 01 PIDs in a loop and
+#   redraws a fixed-size text dashboard in your terminal every refresh
+#   cycle.  Targets the JEEP Gladiator (JT) specifically -- all PIDs
+#   below are confirmed-working on that platform per BMR -- but every
+#   PID is SAE J1979 standardised so the script also works on any
+#   2007+ OBD-II vehicle (Wrangler JL, Grand Cherokee, Ram, non-FCA
+#   vehicles, etc.); only the dashboard labels say "JT" out of habit.
+#
+# STANDALONE
+#   No dependencies on other on-site scripts.  Issues OBD-II Service
+#   0x01 requests directly via cansend / candump, parses responses
+#   inline (single-frame and first-frame PCI handling), no shelling
+#   out to obd.sh / obd2.py.  See bus-message-reference.html#obd-ii
+#   for the framing details mirrored in query_pid() below.
+#
+# POLLED PIDS  (in the order they're queried each cycle)
+#
+#     0x0C  Engine RPM
+#     0x0D  Vehicle speed
+#     0x11  Throttle position
+#     0x43  Absolute load
+#     0x05  Engine coolant temperature
+#     0x5C  Engine oil temperature
+#     0x0F  Intake air temperature
+#     0x46  Ambient air temperature
+#     0x2F  Fuel tank level
+#     0x1F  Run time since engine start
+#     0x42  Control module voltage (~= battery V)
+#
+#   11 PIDs at ~0.2s each = ~2.2s refresh cycle.  Each PID is queried
+#   independently; a missing response leaves that field showing "--"
+#   but doesn't crash the dashboard.
+#
+# USAGE
+#     ./engine-dash.sh                Live dashboard, Ctrl+C to exit
+#     ./engine-dash.sh --once         Print one frame and exit
+#                                     (useful for scripting / logs)
+#     ./engine-dash.sh --help         Print this header
+#
+# OVERRIDABLE ENV VARS
+#     CAN_C            CAN-C interface name        (default: can1)
+#     ECU_REQ_ID       ECM UDS request arb ID      (default: 7E0)
+#     ECU_RES_ID       ECM UDS response arb ID     (default: 7E8)
+#     POLL_WAIT        per-PID response window     (default: 0.2)
+#     POLL_RETRY_WAIT  fallback window on miss     (default: 0.5)
+#     REFRESH_DELAY    extra inter-cycle sleep     (default: 0)
+#
+# OUTPUT (sketch)
+#
+#     +============================================================+
+#     |       JT ENGINE DASHBOARD  (Mode 01 polling, can1)         |
+#     +============================================================+
+#     |  RPM         [######################......]   1234 / 6000  |
+#     |  Speed                                       37 mph / 60 km/h
+#     |  Throttle    [#####.........................]    15 %      |
+#     |  Engine Load [#######.......................]    22 %      |
+#     +============================================================+
+#     |  Coolant     195 F / 90 C   Oil Temp   180 F / 82 C        |
+#     |  Intake Air   95 F / 35 C   Ambient     82 F / 28 C        |
+#     +============================================================+
+#     |  Fuel Level  [#################.............]    68 %      |
+#     |  Run Time    00:14:32                                      |
+#     |  Battery     14.1 V                                        |
+#     +============================================================+
+#     |  Updated 2026-05-18 11:53:42        Ctrl+C to exit         |
+#     +============================================================+
+#
+# REQUIRES
+#     - can-utils (cansend, candump)                 apt install can-utils
+#     - CAN-C interface up at 500 kbps:
+#         ip link set $CAN_C up type can bitrate 500000
+#     - Vehicle powered on (most PIDs return nothing if ignition is off)
+#
+# EXIT CODES
+#     0   Normal exit (--once succeeded, or live loop got SIGINT)
+#     2   Bad CLI usage / pre-flight failure / total ECU blackout on first poll
+#
+
+set -u
+
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
+: "${CAN_C:=can1}"
+: "${ECU_REQ_ID:=7E0}"
+: "${ECU_RES_ID:=7E8}"
+: "${POLL_WAIT:=0.2}"
+: "${POLL_RETRY_WAIT:=0.5}"
+: "${REFRESH_DELAY:=0}"
+
+OBD_MODE=01                # Service 0x01 ShowCurrentData
+
+ONCE=0
+
+case "${1:-}" in
+    -h|--help)
+        awk '/^# engine-dash\.sh/,/^$/ { print }' "$0" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    --once)
+        ONCE=1
+        ;;
+    "") ;;
+    *)
+        echo "unknown arg: $1" >&2
+        echo "usage: $0 [--once] [--help]" >&2
+        exit 2
+        ;;
+esac
+
+# ---------------------------------------------------------------------
+# Inline OBD-II Mode 01 query (was a shell-out to obd.sh in v1).
+#
+# Mirrors the obd.sh single-frame / first-frame PCI handling so we
+# don't lose the two-stage retry behaviour or the multi-byte-PID
+# correctness.  Returns space-separated decimal byte values on stdout,
+# or empty string on no response.  See:
+#   pubCarHacking/scripts/obd.txt
+#   bus-message-reference.html#obd-ii
+# ---------------------------------------------------------------------
+
+# One attempt at a single PID query.  $1 = PID (2 hex chars).
+# $2 = response capture window (seconds).  Echoes data bytes as a
+# raw hex string (e.g. "11B8" for PID 0x0C = RPM 1134), or empty
+# string on timeout / decode failure.
+query_pid_once() {
+    local pid="$1"
+    local wait="$2"
+
+    # Fire the request after a 0.1s delay so candump is already
+    # listening when the ECM replies.
+    ( sleep 0.1
+      cansend "$CAN_C" "${ECU_REQ_ID}#02${OBD_MODE}${pid}0000000000"
+    ) &
+
+    # Capture matching responses on the ECU response ID.  Match both
+    # single-frame (PCI = 0x0L, response shape "..41PID..") and
+    # first-frame (PCI = 0x1L, response shape "10..41PID..") replies.
+    # Take the LAST match if multiple arrive -- it's more likely to
+    # be the response to our query rather than a noise frame from an
+    # earlier request.
+    local response
+    response=$(
+        timeout -s TERM "$wait" candump -L "$CAN_C,${ECU_RES_ID}:0FFF" 2>/dev/null \
+        | grep -E "#..41${pid}|#10..41${pid}" \
+        | cut -d# -f2 \
+        | tail -1
+    )
+
+    [[ -z "$response" ]] && { echo ""; return; }
+
+    local pci="${response:0:2}"
+    local length data
+
+    if [[ "$pci" == "10" ]]; then
+        # First Frame: 12-bit length field; we only need byte 1 here
+        # because OBD-II Mode 01 responses never exceed 255 bytes.
+        length=$((16#${response:2:2}))
+        data="${response:4}"
+    else
+        # Single Frame: low nibble of byte 0 is total length.
+        length=$((16#$pci))
+        data="${response:2}"
+    fi
+
+    # Strip the leading "41 PID" (2 bytes = 4 hex chars) to get just
+    # the data payload.  Then trim to (length - 2) data bytes since
+    # the PCI length includes the service byte and PID echo.
+    local payload_bytes=$((length - 2))
+    (( payload_bytes <= 0 )) && { echo ""; return; }
+    echo "${data:4:$((payload_bytes * 2))}"
+}
+
+# Two-stage retry wrapper.  Returns space-separated decimal bytes for
+# the easier downstream decoding, or empty string on persistent miss.
+poll_pid() {
+    local pid="$1"
+    local hex
+    hex=$(query_pid_once "$pid" "$POLL_WAIT")
+    [[ -z "$hex" ]] && hex=$(query_pid_once "$pid" "$POLL_RETRY_WAIT")
+    [[ -z "$hex" ]] && { echo ""; return; }
+
+    # Hex string -> space-separated decimal bytes.
+    local out="" i byte
+    for ((i = 0; i < ${#hex}; i += 2)); do
+        byte="${hex:i:2}"
+        out+="$((16#$byte)) "
+    done
+    echo "${out% }"
+}
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+# Render a text progress bar.  $1=value $2=max $3=width
+render_bar() {
+    local value="$1" max="$2" width="${3:-30}"
+    if ! [[ "$value" =~ ^-?[0-9]+$ ]]; then
+        printf '[%*s]' "$width" ''
+        return
+    fi
+    local filled=$(( value * width / max ))
+    (( filled > width )) && filled=$width
+    (( filled < 0 )) && filled=0
+    local empty=$(( width - filled ))
+    local bar
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
+    bar="$bar$(printf '%*s' "$empty" '' | tr ' ' '.')"
+    printf '[%s]' "$bar"
+}
+
+# Celsius to Fahrenheit (integer math).
+c_to_f() {
+    local c="$1"
+    if [[ "$c" == "--" ]]; then echo "--"; return; fi
+    echo $(( (c * 9 / 5) + 32 ))
+}
+
+# km/h to mph (integer math).
+kmh_to_mph() {
+    local kmh="$1"
+    if [[ "$kmh" == "--" ]]; then echo "--"; return; fi
+    # 1 km/h = 0.621371 mph; integer approximation = kmh * 1000 / 1609
+    echo $(( kmh * 1000 / 1609 ))
+}
+
+# Seconds to HH:MM:SS.
+fmt_time() {
+    local s="$1"
+    if [[ "$s" == "--" ]]; then echo "--"; return; fi
+    printf '%02d:%02d:%02d' $((s/3600)) $(((s/60)%60)) $((s%60))
+}
+
+# ---------------------------------------------------------------------
+# Per-PID decoders.  Each takes the space-separated decimal-byte string
+# from poll_pid() and returns the engineering-unit value on stdout,
+# or "--" on missing / unparseable input.
+# ---------------------------------------------------------------------
+
+decode_rpm() {
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a b _ <<< "$bytes"
+    [[ -z "${b:-}" ]] && { echo "--"; return; }
+    echo $(( (a * 256 + b) / 4 ))
+}
+
+decode_speed() {
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a _ <<< "$bytes"
+    echo "$a"
+}
+
+decode_pct_byte() {
+    # PIDs with formula A * 100 / 255 = %  (throttle, fuel level)
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a _ <<< "$bytes"
+    echo $(( a * 100 / 255 ))
+}
+
+decode_pct_word() {
+    # PIDs with formula ((A*256)+B) * 100 / 255 = %  (absolute load)
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a b _ <<< "$bytes"
+    [[ -z "${b:-}" ]] && { echo "--"; return; }
+    echo $(( (a * 256 + b) * 100 / 255 ))
+}
+
+decode_temp_c() {
+    # PIDs with formula A - 40 = degC  (coolant, oil, IAT, ambient)
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a _ <<< "$bytes"
+    echo $(( a - 40 ))
+}
+
+decode_runtime() {
+    # PID 0x1F: (A*256)+B = seconds
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a b _ <<< "$bytes"
+    [[ -z "${b:-}" ]] && { echo "--"; return; }
+    echo $(( a * 256 + b ))
+}
+
+decode_voltage() {
+    # PID 0x42: ((A*256)+B) / 1000 = V
+    local bytes="$1"
+    [[ -z "$bytes" ]] && { echo "--"; return; }
+    read -r a b _ <<< "$bytes"
+    [[ -z "${b:-}" ]] && { echo "--"; return; }
+    local mv=$(( a * 256 + b ))
+    printf '%d.%d' $((mv / 1000)) $((mv / 100 % 10))
+}
+
+# ---------------------------------------------------------------------
+# Frame state + renderer
+# ---------------------------------------------------------------------
+
+declare RPM SPEED_KMH THROTTLE LOAD COOLANT_C OIL_C IAT_C AMBIENT_C \
+        FUEL_PCT RUN_SEC VOLTAGE
+
+poll_all() {
+    RPM=$(decode_rpm        "$(poll_pid 0C)")
+    SPEED_KMH=$(decode_speed   "$(poll_pid 0D)")
+    THROTTLE=$(decode_pct_byte "$(poll_pid 11)")
+    LOAD=$(decode_pct_word     "$(poll_pid 43)")
+    COOLANT_C=$(decode_temp_c  "$(poll_pid 05)")
+    OIL_C=$(decode_temp_c      "$(poll_pid 5C)")
+    IAT_C=$(decode_temp_c      "$(poll_pid 0F)")
+    AMBIENT_C=$(decode_temp_c  "$(poll_pid 46)")
+    FUEL_PCT=$(decode_pct_byte "$(poll_pid 2F)")
+    RUN_SEC=$(decode_runtime   "$(poll_pid 1F)")
+    VOLTAGE=$(decode_voltage   "$(poll_pid 42)")
+}
+
+render() {
+    local SPEED_MPH COOLANT_F OIL_F IAT_F AMBIENT_F RUN_HMS
+    SPEED_MPH=$(kmh_to_mph "$SPEED_KMH")
+    COOLANT_F=$(c_to_f "$COOLANT_C")
+    OIL_F=$(c_to_f "$OIL_C")
+    IAT_F=$(c_to_f "$IAT_C")
+    AMBIENT_F=$(c_to_f "$AMBIENT_C")
+    RUN_HMS=$(fmt_time "$RUN_SEC")
+
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    cat <<EOF
++============================================================+
+|        JT ENGINE DASHBOARD  (Mode 01 polling, $CAN_C)        |
++============================================================+
+|  RPM         $(render_bar "$RPM" 6000 30)  $(printf '%5s / 6000' "$RPM")    |
+|  Speed                                     $(printf '%3s mph / %3s km/h' "$SPEED_MPH" "$SPEED_KMH")  |
+|  Throttle    $(render_bar "$THROTTLE" 100 30)  $(printf '%5s %%       ' "$THROTTLE")  |
+|  Engine Load $(render_bar "$LOAD"     100 30)  $(printf '%5s %%       ' "$LOAD")  |
++============================================================+
+|  Coolant   $(printf '%4s F / %3s C' "$COOLANT_F" "$COOLANT_C")     Oil Temp  $(printf '%4s F / %3s C' "$OIL_F" "$OIL_C")  |
+|  Intake Air $(printf '%4s F / %3s C' "$IAT_F" "$IAT_C")     Ambient   $(printf '%4s F / %3s C' "$AMBIENT_F" "$AMBIENT_C")  |
++============================================================+
+|  Fuel Level  $(render_bar "$FUEL_PCT" 100 30)  $(printf '%5s %%       ' "$FUEL_PCT")  |
+|  Run Time    $(printf '%-12s' "$RUN_HMS")                                  |
+|  Battery     $(printf '%-6s' "$VOLTAGE") V                                    |
++============================================================+
+|  Updated $now        Ctrl+C to exit              |
++============================================================+
+EOF
+}
+
+# ---------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------
+
+for cmd in cansend candump; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: $cmd not found.  apt install can-utils" >&2
+        exit 2
+    fi
+done
+
+if ! ip link show "$CAN_C" >/dev/null 2>&1; then
+    echo "ERROR: CAN interface $CAN_C not found" >&2
+    echo "       Bring it up: ip link set $CAN_C up type can bitrate 500000" >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+cleanup() {
+    # Show the cursor again if we hid it, and put a newline before
+    # the prompt so it doesn't land mid-frame.
+    printf '\033[?25h'
+    echo
+    exit 0
+}
+trap cleanup INT TERM
+
+if [[ "$ONCE" -eq 1 ]]; then
+    poll_all
+    render
+    exit 0
+fi
+
+# Hide the cursor during the live loop.
+printf '\033[?25l'
+
+first_poll=1
+
+while true; do
+    poll_all
+    if [[ "$first_poll" -eq 1 ]]; then
+        first_poll=0
+        if [[ "$RPM" == "--" && "$VOLTAGE" == "--" ]]; then
+            cleanup
+            echo "ERROR: no response from the ECU." >&2
+            echo "       Is the vehicle powered on?  Is $CAN_C up at 500 kbps?" >&2
+            echo "       Try: cansend $CAN_C ${ECU_REQ_ID}#02010C0000000000 ; candump $CAN_C,${ECU_RES_ID}:0FFF" >&2
+            echo "       to test request/response directly." >&2
+            exit 2
+        fi
+    fi
+    clear
+    render
+    if [[ "$REFRESH_DELAY" != "0" ]]; then
+        sleep "$REFRESH_DELAY"
+    fi
+done
