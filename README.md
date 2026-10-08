@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-512.png" width="260" alt="CAN Bus Scripts badge: an OBD-II connector wired into a vehicle dashboard with gauges and a diagnostic HUD of cansend/candump commands, under a CAN BUS banner and above a SCRIPTS banner.">
+</p>
+
 # canbus-scripts
 
 A small collection of standalone **bash + [can-utils](https://github.com/linux-can/can-utils)** scripts for CAN bus / OBD-II diagnostics on Linux (Raspberry Pi in-vehicle rigs, bench SocketCAN setups, etc.).
